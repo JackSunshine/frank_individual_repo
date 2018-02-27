@@ -21,6 +21,8 @@ import org.onlab.osgi.DefaultServiceDirectory;
 import org.onlab.osgi.ServiceDirectory;
 import org.onlab.packet.MacAddress;
 import org.onosproject.cli.AbstractShellCommand;
+import org.onosproject.core.ApplicationId;
+import org.onosproject.core.CoreService;
 import org.onosproject.net.Device;
 import org.onosproject.net.DeviceId;
 import org.onosproject.net.device.DeviceService;
@@ -93,6 +95,7 @@ public class VtnCommand extends AbstractShellCommand {
 
         ServiceDirectory serviceDirectory = new DefaultServiceDirectory();
         DeviceService deviceService = serviceDirectory.get(DeviceService.class);
+        CoreService coreService = serviceDirectory.get(CoreService.class);
 
         MeterProgrammable programmable;
         Device device = deviceService.getDevice(DeviceId.deviceId(deviceId));
@@ -120,10 +123,10 @@ public class VtnCommand extends AbstractShellCommand {
                                                   copyFrom(Short.valueOf(ingressPort)), ofOnes(2)))
                                           .addFieldMatch(new PiTernaryFieldMatch(
                                                   PiMatchFieldId.of("hdr.ethernet.src_addr"),
-                                                  copyFrom(MacAddress.valueOf(src).toLong()), ofOnes(6)))
+                                                  copyFrom(MacAddress.valueOf(src).toBytes()), ofOnes(6)))
                                           .addFieldMatch(new PiTernaryFieldMatch(
                                                   PiMatchFieldId.of("hdr.ethernet.dst_addr"),
-                                                  copyFrom(MacAddress.valueOf(dest).toLong()), ofOnes(6)))
+                                                  copyFrom(MacAddress.valueOf(dest).toBytes()), ofOnes(6)))
                                           .build())
                     .build();
 
@@ -174,6 +177,7 @@ public class VtnCommand extends AbstractShellCommand {
                     .withPriority(1000)
                     .makePermanent()
                     .forDevice(DeviceId.deviceId(deviceId))
+                    .fromApp(coreService.getAppId("org.onosproject.app.vtn"))
                     .build();
             rules.add(rule);
             flowrule.applyFlowRules(rules);
