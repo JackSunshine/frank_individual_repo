@@ -129,7 +129,7 @@ public class VtnCommand extends AbstractShellCommand {
                                                   PiMatchFieldId.of("hdr.ethernet.dst_addr"),
                                                   copyFrom(MacAddress.valueOf(dest).toBytes()), ofOnes(6)))
                                           .build())
-                    .withTimeout(1000)
+                    //.withTimeout(1000)
                     .withPriority(1000)
                     .withAction(PiAction.builder().withId(PiActionId.of("_drop")).build())
                     .withCookie(0xfff0323)
@@ -150,6 +150,7 @@ public class VtnCommand extends AbstractShellCommand {
                     .withCellId(entryCellId)
                     .withBands(bands)
                     .forDevice(DeviceId.deviceId(deviceId))
+                    .fromApp(coreService.getAppId("org.onosproject.app.vtn"))
                     .build();
 
             MeterOperation operation = new MeterOperation(meter, MeterOperation.Type.MODIFY);
@@ -205,12 +206,14 @@ public class VtnCommand extends AbstractShellCommand {
                     .withCellId(ingressCellId)
                     .withBands(bands)
                     .forDevice(DeviceId.deviceId(deviceId))
+                    .fromApp(coreService.getAppId("org.onosproject.app.vtn"))
                     .build();
 
             Meter meter2 = DefaultMeter.builder()
                     .withCellId(ergressCellId)
                     .withBands(bands)
                     .forDevice(DeviceId.deviceId(deviceId))
+                    .fromApp(coreService.getAppId("org.onosproject.app.vtn"))
                     .build();
 
             MeterOperation operation = new MeterOperation(meter1, MeterOperation.Type.MODIFY);
