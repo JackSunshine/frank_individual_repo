@@ -121,7 +121,7 @@ public class VtnCommand extends AbstractShellCommand {
                     .withMatchKey(PiMatchKey.builder()
                                           .addFieldMatch(new PiTernaryFieldMatch(
                                                   PiMatchFieldId.of("standard_metadata.ingress_port"),
-                                                  copyFrom(Short.valueOf(ingressPort)), ofOnes(2)))
+                                                  copyFrom(Short.valueOf(ingressPort)), copyFrom(0x01ff)))
                                           .addFieldMatch(new PiTernaryFieldMatch(
                                                   PiMatchFieldId.of("hdr.ethernet.src_addr"),
                                                   copyFrom(MacAddress.valueOf(src).toBytes()), ofOnes(6)))
