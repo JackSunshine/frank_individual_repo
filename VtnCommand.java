@@ -46,6 +46,7 @@ import org.onosproject.net.pi.model.PiTableId;
 import org.onosproject.net.pi.runtime.PiAction;
 import org.onosproject.net.pi.runtime.PiMatchKey;
 import org.onosproject.net.pi.runtime.PiMeterCellId;
+import org.onosproject.net.pi.runtime.PiTableAction;
 import org.onosproject.net.pi.runtime.PiTableEntry;
 import org.onosproject.net.pi.runtime.PiTernaryFieldMatch;
 
@@ -116,7 +117,7 @@ public class VtnCommand extends AbstractShellCommand {
 
         if (!ingressPort.isEmpty()) {
             PiTableEntry tableEntry = PiTableEntry.builder()
-                    .forTable(PiTableId.of("table0"))
+                    .forTable(PiTableId.of("table0_control.table0"))
                     .withMatchKey(PiMatchKey.builder()
                                           .addFieldMatch(new PiTernaryFieldMatch(
                                                   PiMatchFieldId.of("standard_metadata.ingress_port"),
@@ -128,6 +129,10 @@ public class VtnCommand extends AbstractShellCommand {
                                                   PiMatchFieldId.of("hdr.ethernet.dst_addr"),
                                                   copyFrom(MacAddress.valueOf(dest).toBytes()), ofOnes(6)))
                                           .build())
+                    .withTimeout(1000)
+                    .withPriority(1000)
+                    .withAction(PiAction.builder().withId(PiActionId.of("_drop")).build())
+                    .withCookie(0xfff0323)
                     .build();
 
             MeterCellId entryCellId = PiMeterCellId.ofDirect(PiMeterId.of("table0_control.table0_meter"), tableEntry);
