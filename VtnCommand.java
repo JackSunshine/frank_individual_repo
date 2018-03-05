@@ -55,6 +55,8 @@ import java.util.Collection;
 
 import static org.onlab.util.ImmutableByteSequence.copyFrom;
 import static org.onlab.util.ImmutableByteSequence.ofOnes;
+import static org.onlab.util.ImmutableByteSequence.fit;
+import org.onlab.util.ImmutableByteSequence;
 
 /**
  * Supports for updating the external gateway virtualPort.
@@ -116,12 +118,22 @@ public class VtnCommand extends AbstractShellCommand {
         }
 
         if (!ingressPort.isEmpty()) {
+            ImmutableByteSequence inport;
+            ImmutableByteSequence inportMask;
+            try {
+                inport = fit(copyFrom(0x0001), 9);
+                inportMask = fit(copyFrom(0x01ff), 9);
+                log.warn("inportMask {}", inportMask);
+            } catch(Exception e) {
+                log.error("{}", e);
+                return;
+            }
             PiTableEntry tableEntry = PiTableEntry.builder()
                     .forTable(PiTableId.of("table0_control.table0"))
                     .withMatchKey(PiMatchKey.builder()
                                           .addFieldMatch(new PiTernaryFieldMatch(
                                                   PiMatchFieldId.of("standard_metadata.ingress_port"),
-                                                  copyFrom(Short.valueOf(ingressPort)), copyFrom(0x01ff)))
+                                                  inport, inportMask))
                                           .addFieldMatch(new PiTernaryFieldMatch(
                                                   PiMatchFieldId.of("hdr.ethernet.src_addr"),
                                                   copyFrom(MacAddress.valueOf(src).toBytes()), ofOnes(6)))
@@ -130,7 +142,7 @@ public class VtnCommand extends AbstractShellCommand {
                                                   copyFrom(MacAddress.valueOf(dest).toBytes()), ofOnes(6)))
                                           .build())
                     //.withTimeout(1000)
-                    .withPriority(1000)
+                    .withPriority(100)
                     .withAction(PiAction.builder().withId(PiActionId.of("_drop")).build())
                     .withCookie(0xfff0323)
                     .build();
