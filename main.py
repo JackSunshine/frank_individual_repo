@@ -32,6 +32,17 @@ cash_flow_index = {
 }
 
 
+def retry_after_sleep(method):
+    def wrapper(*arg, **kwargs):
+        try:
+            return method(*arg, **kwargs)
+        except Exception as e:
+            time.sleep(10)
+            print("Try again after sleep.")
+            return method(*arg, **kwargs)
+    return wrapper
+
+
 class Stocks(object):
 
     def __init__(self):
@@ -85,6 +96,7 @@ class Stocks(object):
         indutries = {x: y for x, y in stocks['industry'].iteritems()}
         self.all_stocks = {x: y for x, y in stocks['name'].iteritems() if indutries[x] != '银行'}
 
+    @retry_after_sleep
     def _get_actual_years(self, code):
         print(code)
         time.sleep(2)
@@ -98,14 +110,17 @@ class Stocks(object):
     def _convert_to_float(self, series):
         return pd.to_numeric(series, downcast='float', errors='coerce')
 
+    @retry_after_sleep
     def _make_cash_flows(self, code):
         cash_flows = ts.get_cash_flow(code)
         self.cash_flows = {year: self._convert_to_float(cash_flows[year]) for year in self.actual_years}
 
+    @retry_after_sleep
     def _make_profit_statement(self, code):
         profits = ts.get_profit_statement(code)
         self.profit_statements = {year: self._convert_to_float(profits[year]) for year in self.actual_years}
 
+    @retry_after_sleep
     def _make_balance_sheet(self, code):
         balances = ts.get_balance_sheet(code)
         self.balance_sheets = {year: self._convert_to_float(balances[year]) for year in self.actual_years}
@@ -214,3 +229,4 @@ class Stocks(object):
 if __name__ == '__main__':
     stock = Stocks()
     stock.start_washing()
+
