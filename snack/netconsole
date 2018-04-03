@@ -1,0 +1,128 @@
+#encoding=utf-8
+# refs: http://www.wanware.com/tsgdocs/snack.html
+#       https://www.jedsoft.org/slang/doc/html/cslang-8.html
+#       snack.py
+
+
+import traceback
+from snack import *
+import fileinput
+import subprocess
+
+screen = SnackScreen()
+screen.setColor("ROOT", 'black', 'black')
+screen.setColor("HELPLINE", 'white', 'black')
+screen.setColor("LABEL", 'black', 'white')
+
+screen.pushHelpLine(" ")
+FILE = '/etc/ics/icsnet/manageIP.conf'
+
+def write_ip_to_file(ip, mask, gateway):
+    for line in fileinput.input(FILE, inplace=True):
+        if line.startswith('IP='):
+            print('IP=' + ip)
+        elif line.startswith('NETMASK='):
+            print('NETMASK=' + mask)
+        elif line.startswith('GATEWAY='):
+            print('GATEWAY=' + gateway)
+        else:
+            print(line.rstrip('\n'))
+
+def read_ip_from_file():
+    ip, mask, gateway = None, None, None
+    with open(FILE) as f:
+        for line in f.readlines():
+            if line.startswith('IP='):
+                ip = line[len('IP='):]
+            if line.startswith('NETMASK='):
+                mask = line[len('NETMASK='):]
+            if line.startswith('GATEWAY='):
+                gateway = line[len('GATEWAY='):]
+    return ip.rstrip('\n'), mask.rstrip('\n'), gateway.rstrip('\n')
+
+def main_window():
+    title = Textbox(20, 1, 'Customize System', scroll = 0, wrap = 1)
+    help = Textbox(40, 1, '<Esc> Back <Up/Down> Select             ', scroll = 0, wrap = 1)
+    l = Listbox(3, scroll = 0, returnExit = 1, width = 40, showCursor = 0)
+    l.append('Network and Management Interface>>>', 1)
+    l.append('Reboot', 2)
+    l.append('Quit', 3)
+    g = Grid(1, 3)
+    help_grid = Grid(2, 1)
+    help_grid.setField(help, 0, 0)
+    g.setField(title, 0, 0)
+    g.setField(l, 0, 1, (0, 1, 0, 3))
+    g.setField(help_grid, 0, 2)
+    screen.gridWrappedWindow(g, "Configuration")
+    f = Form()
+    f.add(g)
+    result = f.run()
+    screen.popWindow()
+    if l.current() == 1:
+        l.setCallback(network_info_widget())
+    elif l.current() == 2:
+        l.setCallback(reboot())
+    elif l.current() == 3:
+        l.setCallback(sys_quit())
+
+def network_info_widget():
+    ip, mask, gateway = read_ip_from_file()
+    ip_label = Label(text = 'IP')
+    ip_value = Entry(28, text = ip, hidden = 0, password = 0, scroll = 1, returnExit = 1)
+    mask_label = Label(text = 'NETMASK')
+    mask_value = Entry(28, text = mask, hidden = 0, password = 0, scroll = 1, returnExit = 1)
+    gateway_label = Label(text = 'GATEWAY')
+    gateway_value = Entry(28, text = gateway, hidden = 0, password = 0, scroll = 1, returnExit = 1)
+    text = Textbox(36, 4, 'Current management IP Configuration:\n'
+                          'IP=%s'
+                          'NETMASK=%s'
+                          'GATEWAY=%s'%(read_ip_from_file()),
+                   scroll = 0, wrap = 1)
+    title = Textbox(36, 3, '------------------------------------\n'
+                           'Configure Management IP', scroll = 0, wrap = 1)
+    bar = ButtonBar(screen, [('Save', 1),('Cancel', 0)])
+    help = Textbox(36, 1, '<Esc> Back <Up/Down> Select         ', scroll = 0, wrap = 1)
+
+    grid = Grid(1, 5)
+    grid_network = Grid(2, 3)
+    grid_network.setField(ip_label, 0, 0, (0, 0, 1, 0))
+    grid_network.setField(ip_value, 1, 0, (0, 0, 1, 0))
+    grid_network.setField(mask_label, 0, 1, (0, 0, 1, 0))
+    grid_network.setField(mask_value, 1, 1, (0, 0, 1, 0))
+    grid_network.setField(gateway_label, 0, 2, (0, 0, 1, 1))
+    grid_network.setField(gateway_value, 1, 2, (0, 0, 1, 1))
+    grid.setField(text, 0, 0)
+    grid.setField(title, 0, 1)
+    grid.setField(grid_network, 0, 2)
+    grid.setField(bar, 0, 3, (0, 0, 0, 3))
+    grid.setField(help, 0, 4)
+
+    screen.gridWrappedWindow(grid, "Configuration")
+    f = Form()
+    f.addHotKey("ESC")
+    f.add(grid)
+    result = f.run()
+    screen.popWindow()
+    if bar.buttonPressed(result):
+        write_ip_to_file(ip_value.value(), mask_value.value(), gateway_value.value())
+    main_window()
+    #save.setCallback(main_window())
+    #cancel.setCallback(main_window())
+
+def reboot():
+    subprocess.call('reboot', shell = True)
+
+def sys_quit():
+    pass
+
+def main():
+    try:
+        main_window()
+    except:
+        print traceback.format_exc()
+    finally:
+        screen.finish()
+        return ''
+
+if __name__ == '__main__':
+    main()
