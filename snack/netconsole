@@ -2,6 +2,7 @@
 # refs: http://www.wanware.com/tsgdocs/snack.html
 #       https://www.jedsoft.org/slang/doc/html/cslang-8.html
 #       snack.py
+#       ldd _snackmodule.so
 
 
 import traceback
