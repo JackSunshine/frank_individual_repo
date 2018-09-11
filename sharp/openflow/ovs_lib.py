@@ -1,0 +1,682 @@
+# Copyright 2011 VMware, Inc.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+import random
+import uuid
+
+
+import logging
+import six
+import tenacity
+
+from common import constants
+
+UINT64_BITMASK = (1 << 64) - 1
+
+# Special return value for an invalid OVS ofport
+INVALID_OFPORT = -1
+UNASSIGNED_OFPORT = []
+
+# OVS bridge fail modes
+FAILMODE_SECURE = 'secure'
+FAILMODE_STANDALONE = 'standalone'
+
+# special values for cookies
+COOKIE_ANY = object()
+
+LOG = logging.getLogger(__name__)
+
+OVS_DEFAULT_CAPS = {
+    'datapath_types': [],
+    'iface_types': [],
+}
+
+# It's default queue, all packets not tagged with 'set_queue' will go through
+# this one
+QOS_DEFAULT_QUEUE = 0
+
+_SENTINEL = object()
+
+CTRL_RATE_LIMIT_MIN = 100
+CTRL_BURST_LIMIT_MIN = 25
+
+
+def _ovsdb_result_pending(result):
+    """Return True if ovs-vsctl indicates the result is still pending."""
+    # ovs-vsctl can return '[]' for an ofport that has not yet been assigned
+    return result == []
+
+
+def _ovsdb_retry(fn):
+    """Decorator for retrying when OVS has yet to assign an ofport.
+
+    The instance's vsctl_timeout is used as the max waiting time. This relies
+    on the fact that instance methods receive self as the first argument.
+    """
+    @six.wraps(fn)
+    def wrapped(*args, **kwargs):
+        self = args[0]
+        new_fn = tenacity.retry(
+            reraise=True,
+            retry=tenacity.retry_if_result(_ovsdb_result_pending),
+            wait=tenacity.wait_exponential(multiplier=0.01, max=1),
+            stop=tenacity.stop_after_delay(
+                self.vsctl_timeout))(fn)
+        return new_fn(*args, **kwargs)
+    return wrapped
+
+
+class VifPort(object):
+    def __init__(self, port_name, ofport, vif_id, vif_mac, switch):
+        self.port_name = port_name
+        self.ofport = ofport
+        self.vif_id = vif_id
+        self.vif_mac = vif_mac
+        self.switch = switch
+
+    def __str__(self):
+        return ("iface-id=%s, vif_mac=%s, port_name=%s, ofport=%s, "
+                "bridge_name=%s") % (
+                   self.vif_id, self.vif_mac,
+                   self.port_name, self.ofport,
+                   self.switch.br_name)
+
+
+class BaseOVS(object):
+
+    def __init__(self, ovsdb_client):
+        self.vsctl_timeout = constants.DEFAULT_OVSDB_TIMEOUT
+        self.ovsdb = ovsdb_client
+
+    def add_manager(self, connection_uri, timeout=_SENTINEL):
+        """Have ovsdb-server listen for manager connections
+
+        :param connection_uri: Manager target string
+        :param timeout: The Manager probe_interval timeout value
+                        (defaults to ovsdb_timeout)
+        """
+        if timeout is _SENTINEL:
+            timeout = constants.DEFAULT_OVSDB_TIMEOUT
+        with self.ovsdb.transaction() as txn:
+            txn.add(self.ovsdb.add_manager(connection_uri))
+            if timeout:
+                txn.add(
+                    self.ovsdb.db_set('Manager', connection_uri,
+                                      ('inactivity_probe', timeout * 1000)))
+
+    def get_manager(self):
+        return self.ovsdb.get_manager().execute()
+
+    def remove_manager(self, connection_uri):
+        self.ovsdb.remove_manager(connection_uri).execute()
+
+    def add_bridge(self, bridge_name,
+                   datapath_type=constants.OVS_DATAPATH_SYSTEM):
+        br = OVSBridge(bridge_name, datapath_type=datapath_type)
+        br.create()
+        return br
+
+    def delete_bridge(self, bridge_name):
+        self.ovsdb.del_br(bridge_name).execute()
+
+    def bridge_exists(self, bridge_name):
+        return self.ovsdb.br_exists(bridge_name).execute()
+
+    def port_exists(self, port_name):
+        cmd = self.ovsdb.db_get('Port', port_name, 'name')
+        return bool(cmd.execute(check_error=False, log_errors=False))
+
+    def get_bridge_for_iface(self, iface):
+        return self.ovsdb.iface_to_br(iface).execute()
+
+    def get_bridges(self):
+        return self.ovsdb.list_br().execute(check_error=True)
+
+    def get_bridge_external_bridge_id(self, bridge):
+        return self.ovsdb.br_get_external_id(bridge, 'bridge-id').execute()
+
+    def set_db_attribute(self, table_name, record, column, value,
+                         check_error=False, log_errors=True):
+        self.ovsdb.db_set(table_name, record, (column, value)).execute(
+            check_error=check_error, log_errors=log_errors)
+
+    def clear_db_attribute(self, table_name, record, column):
+        self.ovsdb.db_clear(table_name, record, column).execute()
+
+    def db_get_val(self, table, record, column, check_error=False,
+                   log_errors=True):
+        return self.ovsdb.db_get(table, record, column).execute(
+            check_error=check_error, log_errors=log_errors)
+
+    @property
+    def config(self):
+        """A dict containing the only row from the root Open_vSwitch table
+
+        This row contains several columns describing the Open vSwitch install
+        and the system on which it is installed. Useful keys include:
+            datapath_types: a list of supported datapath types
+            iface_types: a list of supported interface types
+            ovs_version: the OVS version
+        """
+        return self.ovsdb.db_list("Open_vSwitch").execute()[0]
+
+    @property
+    def capabilities(self):
+        _cfg = self.config
+        return {k: _cfg.get(k, OVS_DEFAULT_CAPS[k]) for k in OVS_DEFAULT_CAPS}
+
+
+# Map from version string to on-the-wire protocol version encoding:
+OF_PROTOCOL_TO_VERSION = {
+    constants.OPENFLOW10: 1,
+    constants.OPENFLOW11: 2,
+    constants.OPENFLOW12: 3,
+    constants.OPENFLOW13: 4,
+    constants.OPENFLOW14: 5,
+    constants.OPENFLOW15: 6,
+}
+
+
+def version_from_protocol(protocol):
+    if protocol not in OF_PROTOCOL_TO_VERSION:
+        raise Exception("unknown OVS protocol string, cannot compare: %s, "
+                        "(known: %s)" % (protocol,
+                                         list(OF_PROTOCOL_TO_VERSION)))
+    return OF_PROTOCOL_TO_VERSION[protocol]
+
+
+class OVSBridge(BaseOVS):
+    def __init__(self, br_name, ovsdb_client, datapath_type=constants.OVS_DATAPATH_SYSTEM):
+        super(OVSBridge, self).__init__(ovsdb_client)
+        self.br_name = br_name
+        self.datapath_type = datapath_type
+        self._default_cookie = generate_random_cookie()
+        self._highest_protocol_needed = constants.OPENFLOW10
+
+    @property
+    def default_cookie(self):
+        return self._default_cookie
+
+    def set_agent_uuid_stamp(self, val):
+        self._default_cookie = val
+
+    def set_controller(self, controllers):
+        self.ovsdb.set_controller(self.br_name,
+                                  controllers).execute(check_error=True)
+
+    def del_controller(self):
+        self.ovsdb.del_controller(self.br_name).execute(check_error=True)
+
+    def get_controller(self):
+        return self.ovsdb.get_controller(self.br_name).execute(
+            check_error=True)
+
+    def _set_bridge_fail_mode(self, mode):
+        self.ovsdb.set_fail_mode(self.br_name, mode).execute(check_error=True)
+
+    def set_secure_mode(self):
+        self._set_bridge_fail_mode(FAILMODE_SECURE)
+
+    def set_standalone_mode(self):
+        self._set_bridge_fail_mode(FAILMODE_STANDALONE)
+
+    def add_protocols(self, *protocols):
+        self.ovsdb.db_add('Bridge', self.br_name,
+                          'protocols', *protocols).execute(check_error=True)
+
+    def use_at_least_protocol(self, protocol):
+        """Calls to ovs-ofctl will use a protocol version >= 'protocol'"""
+        self.add_protocols(protocol)
+        self._highest_protocol_needed = max(self._highest_protocol_needed,
+                                            protocol,
+                                            key=version_from_protocol)
+
+    def create(self, secure_mode=False):
+        other_config = {
+            'mac-table-size': str(constants.BRIDGE_MAC_TABLE_SIZE)}
+        with self.ovsdb.transaction() as txn:
+            txn.add(
+                self.ovsdb.add_br(self.br_name,
+                                  datapath_type=self.datapath_type))
+            # the ovs-ofctl commands below in run_ofctl use OF10, so we
+            # need to ensure that this version is enabled ; we could reuse
+            # add_protocols, but doing ovsdb.db_add avoids doing two
+            # transactions
+            txn.add(
+                self.ovsdb.db_add('Bridge', self.br_name,
+                                  'protocols', self._highest_protocol_needed))
+            txn.add(
+                self.ovsdb.db_set('Bridge', self.br_name,
+                                  ('other_config', other_config)))
+            if secure_mode:
+                txn.add(self.ovsdb.set_fail_mode(self.br_name,
+                                                 FAILMODE_SECURE))
+
+    def destroy(self):
+        self.delete_bridge(self.br_name)
+
+    def add_port(self, port_name, *interface_attr_tuples):
+        with self.ovsdb.transaction() as txn:
+            txn.add(self.ovsdb.add_port(self.br_name, port_name))
+            if interface_attr_tuples:
+                txn.add(self.ovsdb.db_set('Interface', port_name,
+                                          *interface_attr_tuples))
+        return self.get_port_ofport(port_name)
+
+    def delete_port(self, port_name):
+        self.ovsdb.del_port(port_name, self.br_name).execute()
+
+    @_ovsdb_retry
+    def _get_port_val(self, port_name, port_val):
+        return self.db_get_val("Interface", port_name, port_val)
+
+    def get_port_ofport(self, port_name):
+        """Get the port's assigned ofport, retrying if not yet assigned."""
+        ofport = INVALID_OFPORT
+        try:
+            ofport = self._get_port_val(port_name, "ofport")
+        except tenacity.RetryError:
+            LOG.exception("Timed out retrieving ofport on port %s.",
+                          port_name)
+        return ofport
+
+    def get_port_external_ids(self, port_name):
+        """Get the port's assigned ofport, retrying if not yet assigned."""
+        port_external_ids = dict()
+        try:
+            port_external_ids = self._get_port_val(port_name, "external_ids")
+        except tenacity.RetryError:
+            LOG.exception("Timed out retrieving external_ids on port %s.",
+                          port_name)
+        return port_external_ids
+
+    def get_port_mac(self, port_name):
+        """Get the port's mac address.
+
+        This is especially useful when the port is not a neutron port.
+        E.g. networking-sfc needs the MAC address of "patch-tun
+        """
+        return self.db_get_val("Interface", port_name, "mac_in_use")
+
+    @_ovsdb_retry
+    def _get_datapath_id(self):
+        return self.db_get_val('Bridge', self.br_name, 'datapath_id')
+
+    def get_datapath_id(self):
+        try:
+            return self._get_datapath_id()
+        except tenacity.RetryError:
+            # if ovs fails to find datapath_id then something is likely to be
+            # broken here
+            LOG.exception("Timed out retrieving datapath_id on bridge %s.",
+                          self.br_name)
+            raise RuntimeError('No datapath_id on bridge %s' % self.br_name)
+
+    def add_patch_port(self, local_name, remote_name):
+        attrs = [('type', 'patch'),
+                 ('options', {'peer': remote_name})]
+        return self.add_port(local_name, *attrs)
+
+    def get_iface_name_list(self):
+        # get the interface name list for this bridge
+        return self.ovsdb.list_ifaces(self.br_name).execute(check_error=True)
+
+    def get_port_name_list(self):
+        # get the port name list for this bridge
+        return self.ovsdb.list_ports(self.br_name).execute(check_error=True)
+
+    def get_port_stats(self, port_name):
+        return self.db_get_val("Interface", port_name, "statistics")
+
+    def get_ports_attributes(self, table, columns=None, ports=None,
+                             check_error=True, log_errors=True,
+                             if_exists=False):
+        port_names = ports or self.get_port_name_list()
+        if not port_names:
+            return []
+        return (self.ovsdb.db_list(table, port_names, columns=columns,
+                                   if_exists=if_exists).
+                execute(check_error=check_error, log_errors=log_errors))
+
+    # returns a VIF object for each VIF port
+    def get_vif_ports(self, ofport_filter=None):
+        edge_ports = []
+        port_info = self.get_ports_attributes(
+            'Interface', columns=['name', 'external_ids', 'ofport'],
+            if_exists=True)
+        for port in port_info:
+            name = port['name']
+            external_ids = port['external_ids']
+            ofport = port['ofport']
+            if ofport_filter and ofport in ofport_filter:
+                continue
+            if "iface-id" in external_ids and "attached-mac" in external_ids:
+                p = VifPort(name, ofport, external_ids["iface-id"],
+                            external_ids["attached-mac"], self)
+                edge_ports.append(p)
+
+        return edge_ports
+
+    def get_vif_port_to_ofport_map(self):
+        results = self.get_ports_attributes(
+            'Interface', columns=['name', 'external_ids', 'ofport'],
+            if_exists=True)
+        port_map = {}
+        for r in results:
+            # fall back to basic interface name
+            key = self.portid_from_external_ids(r['external_ids']) or r['name']
+            try:
+                port_map[key] = int(r['ofport'])
+            except TypeError:
+                # port doesn't yet have an ofport entry so we ignore it
+                pass
+        return port_map
+
+    def get_vif_port_set(self):
+        edge_ports = set()
+        results = self.get_ports_attributes(
+            'Interface', columns=['name', 'external_ids', 'ofport'],
+            if_exists=True)
+        for result in results:
+            if result['ofport'] == UNASSIGNED_OFPORT:
+                LOG.warning("Found not yet ready openvswitch port: %s",
+                            result['name'])
+            elif result['ofport'] == INVALID_OFPORT:
+                LOG.warning("Found failed openvswitch port: %s",
+                            result['name'])
+            elif 'attached-mac' in result['external_ids']:
+                port_id = self.portid_from_external_ids(result['external_ids'])
+                if port_id:
+                    edge_ports.add(port_id)
+        return edge_ports
+
+    def portid_from_external_ids(self, external_ids):
+        if 'iface-id' in external_ids:
+            return external_ids['iface-id']
+
+    def get_port_tag_dict(self):
+        """Get a dict of port names and associated vlan tags.
+
+        e.g. the returned dict is of the following form::
+
+            {u'int-br-eth2': [],
+             u'patch-tun': [],
+             u'qr-76d9e6b6-21': 1,
+             u'tapce5318ff-78': 1,
+             u'tape1400310-e6': 1}
+
+        The TAG ID is only available in the "Port" table and is not available
+        in the "Interface" table queried by the get_vif_port_set() method.
+
+        """
+        results = self.get_ports_attributes(
+            'Port', columns=['name', 'tag'], if_exists=True)
+        return {p['name']: p['tag'] for p in results}
+
+    def get_vifs_by_ids(self, port_ids):
+        interface_info = self.get_ports_attributes(
+            "Interface", columns=["name", "external_ids", "ofport"],
+            if_exists=True)
+        by_id = {x['external_ids'].get('iface-id'): x for x in interface_info}
+        result = {}
+        for port_id in port_ids:
+            result[port_id] = None
+            if port_id not in by_id:
+                LOG.info("Port %(port_id)s not present in bridge "
+                         "%(br_name)s",
+                         {'port_id': port_id, 'br_name': self.br_name})
+                continue
+            pinfo = by_id[port_id]
+            if not self._check_ofport(port_id, pinfo):
+                continue
+            mac = pinfo['external_ids'].get('attached-mac')
+            result[port_id] = VifPort(pinfo['name'], pinfo['ofport'],
+                                      port_id, mac, self)
+        return result
+
+    @staticmethod
+    def _check_ofport(port_id, port_info):
+        if port_info['ofport'] in [UNASSIGNED_OFPORT, INVALID_OFPORT]:
+            LOG.warning("ofport: %(ofport)s for VIF: %(vif)s "
+                        "is not a positive integer",
+                        {'ofport': port_info['ofport'], 'vif': port_id})
+            return False
+        return True
+
+    def get_vif_port_by_id(self, port_id):
+        ports = self.ovsdb.db_find(
+            'Interface', ('external_ids', '=', {'iface-id': port_id}),
+            ('external_ids', '!=', {'attached-mac': ''}),
+            columns=['external_ids', 'name', 'ofport']).execute()
+        for port in ports:
+            if self.br_name != self.get_bridge_for_iface(port['name']):
+                continue
+            if not self._check_ofport(port_id, port):
+                continue
+            mac = port['external_ids'].get('attached-mac')
+            return VifPort(port['name'], port['ofport'], port_id, mac, self)
+        LOG.info("Port %(port_id)s not present in bridge %(br_name)s",
+                 {'port_id': port_id, 'br_name': self.br_name})
+
+    def delete_ports(self, all_ports=False):
+        if all_ports:
+            port_names = self.get_port_name_list()
+        else:
+            port_names = (port.port_name for port in self.get_vif_ports())
+
+        for port_name in port_names:
+            self.delete_port(port_name)
+
+    def set_controllers_connection_mode(self, connection_mode):
+        """Set bridge controllers connection mode.
+
+        :param connection_mode: "out-of-band" or "in-band"
+        """
+        self.set_controller_field('connection_mode', connection_mode)
+
+    def _set_egress_bw_limit_for_port(self, port_name, max_kbps,
+                                      max_burst_kbps):
+        with self.ovsdb.transaction(check_error=True) as txn:
+            txn.add(self.ovsdb.db_set('Interface', port_name,
+                                      ('ingress_policing_rate', max_kbps)))
+            txn.add(self.ovsdb.db_set('Interface', port_name,
+                                      ('ingress_policing_burst',
+                                       max_burst_kbps)))
+
+    def create_egress_bw_limit_for_port(self, port_name, max_kbps,
+                                        max_burst_kbps):
+        self._set_egress_bw_limit_for_port(
+            port_name, max_kbps, max_burst_kbps)
+
+    def get_egress_bw_limit_for_port(self, port_name):
+
+        max_kbps = self.db_get_val('Interface', port_name,
+                                   'ingress_policing_rate')
+        max_burst_kbps = self.db_get_val('Interface', port_name,
+                                         'ingress_policing_burst')
+
+        max_kbps = max_kbps or None
+        max_burst_kbps = max_burst_kbps or None
+
+        return max_kbps, max_burst_kbps
+
+    def delete_egress_bw_limit_for_port(self, port_name):
+        if not self.port_exists(port_name):
+            return
+        self._set_egress_bw_limit_for_port(
+            port_name, 0, 0)
+
+    def find_qos(self, port_name):
+        qos = self.ovsdb.db_find(
+            'QoS',
+            ('external_ids', '=', {'id': port_name}),
+            columns=['_uuid', 'other_config']).execute(check_error=True)
+        if qos:
+            return qos[0]
+
+    def find_queue(self, port_name, queue_type):
+        queues = self.ovsdb.db_find(
+            'Queue',
+            ('external_ids', '=', {'id': port_name,
+                                   'queue_type': str(queue_type)}),
+            columns=['_uuid', 'other_config']).execute(check_error=True)
+        if queues:
+            return queues[0]
+
+    def _update_bw_limit_queue(self, txn, port_name, queue_uuid, queue_type,
+                               other_config):
+        if queue_uuid:
+            txn.add(self.ovsdb.db_set(
+                'Queue', queue_uuid,
+                ('other_config', other_config)))
+        else:
+            external_ids = {'id': port_name,
+                            'queue_type': str(queue_type)}
+            queue_uuid = txn.add(
+                self.ovsdb.db_create(
+                    'Queue', external_ids=external_ids,
+                    other_config=other_config))
+        return queue_uuid
+
+    def _update_bw_limit_profile(self, txn, port_name, qos_uuid,
+                                 queue_uuid, queue_type, qos_other_config):
+        queues = {queue_type: queue_uuid}
+        if qos_uuid:
+            txn.add(self.ovsdb.db_set(
+                'QoS', qos_uuid, ('queues', queues)))
+            txn.add(self.ovsdb.db_set(
+                'QoS', qos_uuid, ('other_config', qos_other_config)))
+        else:
+            external_ids = {'id': port_name}
+            qos_uuid = txn.add(
+                self.ovsdb.db_create(
+                    'QoS', external_ids=external_ids,
+                    type='linux-htb',
+                    queues=queues,
+                    other_config=qos_other_config))
+        return qos_uuid
+
+    def _update_bw_limit_profile_dpdk(self, txn, port_name, qos_uuid,
+                                      other_config):
+        if qos_uuid:
+            txn.add(self.ovsdb.db_set(
+                'QoS', qos_uuid, ('other_config', other_config)))
+        else:
+            external_ids = {'id': port_name}
+            qos_uuid = txn.add(
+                self.ovsdb.db_create(
+                    'QoS', external_ids=external_ids, type='egress-policer',
+                    other_config=other_config))
+        return qos_uuid
+
+    def _update_ingress_bw_limit_for_port(
+            self, port_name, max_bw_in_bits, max_burst_in_bits):
+        qos_other_config = {
+            'max-rate': str(max_bw_in_bits)
+        }
+        queue_other_config = {
+            'max-rate': str(max_bw_in_bits),
+            'burst': str(max_burst_in_bits),
+        }
+        qos = self.find_qos(port_name)
+        queue = self.find_queue(port_name, QOS_DEFAULT_QUEUE)
+        qos_uuid = qos['_uuid'] if qos else None
+        queue_uuid = queue['_uuid'] if queue else None
+        with self.ovsdb.transaction(check_error=True) as txn:
+            queue_uuid = self._update_bw_limit_queue(
+                txn, port_name, queue_uuid, QOS_DEFAULT_QUEUE,
+                queue_other_config
+            )
+
+            qos_uuid = self._update_bw_limit_profile(
+                txn, port_name, qos_uuid, queue_uuid, QOS_DEFAULT_QUEUE,
+                qos_other_config
+            )
+
+            txn.add(self.ovsdb.db_set(
+                'Port', port_name, ('qos', qos_uuid)))
+
+    def _update_ingress_bw_limit_for_dpdk_port(
+            self, port_name, max_bw_in_bits, max_burst_in_bits):
+        # cir and cbs should be set in bytes instead of bits
+        qos_other_config = {
+            'cir': str(max_bw_in_bits / 8),
+            'cbs': str(max_burst_in_bits / 8)
+        }
+        qos = self.find_qos(port_name)
+        qos_uuid = qos['_uuid'] if qos else None
+        with self.ovsdb.transaction(check_error=True) as txn:
+            qos_uuid = self._update_bw_limit_profile_dpdk(
+                txn, port_name, qos_uuid, qos_other_config)
+            txn.add(self.ovsdb.db_set(
+                'Port', port_name, ('qos', qos_uuid)))
+
+    def delete_ingress_bw_limit_for_port(self, port_name):
+        qos = self.find_qos(port_name)
+        queue = self.find_queue(port_name, QOS_DEFAULT_QUEUE)
+        does_port_exist = self.port_exists(port_name)
+        with self.ovsdb.transaction(check_error=True) as txn:
+            if does_port_exist:
+                txn.add(self.ovsdb.db_clear("Port", port_name, 'qos'))
+            if qos:
+                txn.add(self.ovsdb.db_destroy('QoS', qos['_uuid']))
+            if queue:
+                txn.add(self.ovsdb.db_destroy('Queue', queue['_uuid']))
+
+    def set_controller_field(self, field, value):
+        attr = [(field, value)]
+        controllers = self.db_get_val('Bridge', self.br_name, 'controller')
+        controllers = [controllers] if isinstance(
+            controllers, uuid.UUID) else controllers
+        with self.ovsdb.transaction(check_error=True) as txn:
+            for controller_uuid in controllers:
+                txn.add(self.ovsdb.db_set(
+                    'Controller', controller_uuid, *attr))
+
+    def set_controller_rate_limit(self, controller_rate_limit):
+        """Set bridge controller_rate_limit
+
+        :param controller_rate_limit: at least 100
+        """
+        if controller_rate_limit < CTRL_RATE_LIMIT_MIN:
+            LOG.info("rate limit's value must be at least 100")
+            controller_rate_limit = CTRL_RATE_LIMIT_MIN
+        self.set_controller_field(
+            'controller_rate_limit', controller_rate_limit)
+
+    def set_controller_burst_limit(self, controller_burst_limit):
+        """Set bridge controller_burst_limit
+
+        :param controller_burst_limit: at least 25
+        """
+        if controller_burst_limit < CTRL_BURST_LIMIT_MIN:
+            LOG.info("burst limit's value must be at least 25")
+            controller_burst_limit = CTRL_BURST_LIMIT_MIN
+        self.set_controller_field(
+            'controller_burst_limit', controller_burst_limit)
+
+    def __enter__(self):
+        self.create()
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        self.destroy()
+
+
+def generate_random_cookie():
+    # The OpenFlow spec forbids use of -1
+    return random.randrange(UINT64_BITMASK)
+
+
